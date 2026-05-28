@@ -22,6 +22,10 @@
 #   sudo ./x710-unlock.sh --yes           # ohne Rueckfragen (Vorsicht!)
 #   sudo ./x710-unlock.sh --dry-run       # nur analysieren, nichts schreiben
 #   sudo ./x710-unlock.sh --restore       # Patch rueckgaengig (Bit 11 setzen)
+#   sudo ./x710-unlock.sh --build-only    # nur die Hilfsprogramme bauen (z.B. auf
+#                                         #   einem Live-USB), dann auf Unraid mitnehmen
+#   sudo ./x710-unlock.sh --prebuilt DIR  # vorgebaute Hilfsprogramme aus DIR nutzen
+#                                         #   (gcc auf dem Zielsystem nicht noetig)
 #
 set -euo pipefail
 
@@ -35,11 +39,17 @@ RELOAD_SETTLE=4         # Sekunden Wartezeit nach modprobe
 WORKDIR="$(mktemp -d /tmp/x710-unlock.XXXXXX)"
 BACKUPDIR="${HOME}/x710-unlock-backups"
 
+# Basis-URL fuer vorgebaute Hilfsprogramme (genutzt wenn kein gcc + kein --prebuilt).
+# Erwartet dort die Dateien: x710_read, x710_write, x710_csum (x86_64 ELF).
+PREBUILT_URL_BASE="https://raw.githubusercontent.com/Maxcyber86/x710-unlock/main/x710-prebuilt"
+
 # ---------- Flags ----------
 IFACE=""
 ASSUME_YES=0
 DRY_RUN=0
 RESTORE=0
+PREBUILT_DIR=""
+BUILD_ONLY=0
 
 # ---------- Farben ----------
 if [[ -t 1 ]]; then
@@ -65,8 +75,10 @@ while [[ $# -gt 0 ]]; do
         -y|--yes)     ASSUME_YES=1; shift ;;
         --dry-run)    DRY_RUN=1; shift ;;
         --restore)    RESTORE=1; shift ;;
+        --prebuilt)   PREBUILT_DIR="$2"; shift 2 ;;
+        --build-only) BUILD_ONLY=1; shift ;;
         -h|--help)
-            grep '^#' "$0" | grep -v '^#!' | sed 's/^# \?//' | head -32
+            grep '^#' "$0" | grep -v '^#!' | sed 's/^# \?//' | head -40
             exit 0 ;;
         *) die "Unbekanntes Argument: $1 (--help fuer Hilfe)" ;;
     esac
@@ -94,11 +106,58 @@ if [[ "$OS" == "unraid" ]]; then
     info "Unraid-Version: ${UNRAID_VER:-unbekannt}"
 fi
 
-# Tool-Verfuegbarkeit pruefen
+# Tool-Verfuegbarkeit pruefen.
+# gcc wird NUR gebraucht, wenn wir selbst kompilieren (kein --prebuilt).
+NEED_GCC=1
+[[ -n "$PREBUILT_DIR" ]] && NEED_GCC=0
+
+# ---------- Auto-Download vorgebauter Binaries ----------
+# Laedt x710_read/write/csum von PREBUILT_URL_BASE nach $1, validiert ELF-Magic.
+# Rueckgabe 0 = Erfolg (alle drei valide), sonst 1.
+fetch_prebuilt() {
+    local dest="$1" dl="" tool
+    command -v curl >/dev/null 2>&1 && dl="curl -fsSL -o"
+    [[ -z "$dl" ]] && command -v wget >/dev/null 2>&1 && dl="wget -qO"
+    [[ -z "$dl" ]] && { warn "Weder curl noch wget vorhanden - kein Auto-Download moeglich."; return 1; }
+    mkdir -p "$dest"
+    for tool in x710_read x710_write x710_csum; do
+        if ! $dl "$dest/$tool" "$PREBUILT_URL_BASE/$tool" 2>/dev/null; then
+            warn "Download fehlgeschlagen: $PREBUILT_URL_BASE/$tool"
+            return 1
+        fi
+        # ELF-Magic pruefen (0x7f 'E' 'L' 'F'), sonst ist es z.B. eine 404-HTML-Seite
+        if [[ "$(head -c4 "$dest/$tool" | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]]; then
+            warn "Heruntergeladene Datei ist kein ELF-Binary: $tool (evtl. fehlt sie im Repo?)"
+            return 1
+        fi
+        chmod +x "$dest/$tool"
+    done
+    return 0
+}
+
+# Wenn wir kompilieren muessten (kein --prebuilt) aber gcc fehlt:
+# zuerst Auto-Download der Binaries versuchen, bevor wir aufgeben.
+if [[ $NEED_GCC -eq 1 ]] && ! command -v gcc >/dev/null 2>&1; then
+    step "Kein gcc gefunden - versuche vorgebaute Hilfsprogramme zu laden"
+    info "Quelle: $PREBUILT_URL_BASE"
+    DL_DIR="$WORKDIR/prebuilt-dl"
+    if fetch_prebuilt "$DL_DIR"; then
+        ok "Vorgebaute Hilfsprogramme heruntergeladen und als ELF validiert"
+        PREBUILT_DIR="$DL_DIR"
+        NEED_GCC=0
+    else
+        warn "Auto-Download nicht moeglich - fahre fort mit der ueblichen Pruefung."
+    fi
+fi
+
+RUNTIME_TOOLS=(ethtool lspci ip)
 MISSING=()
-for tool in gcc ethtool lspci ip; do
+for tool in "${RUNTIME_TOOLS[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || MISSING+=("$tool")
 done
+if [[ $NEED_GCC -eq 1 ]]; then
+    command -v gcc >/dev/null 2>&1 || MISSING+=("gcc")
+fi
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     warn "Fehlende Tools: ${MISSING[*]}"
@@ -109,26 +168,45 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
                 die "Installation fehlgeschlagen. Bitte manuell: apt install build-essential ethtool pciutils iproute2"
             ;;
         unraid)
-            err "Auf Unraid werden Pakete nicht automatisch installiert."
-            err "Unraid bringt standardmaessig keinen Compiler mit. Loesungen:"
-            err "  1. Plugin 'NerdTools' (via Community Applications) installieren und dort"
-            err "     gcc, make, binutils aktivieren. Danach dieses Script erneut starten."
-            err "  2. Alternativ die drei Hilfsprogramme auf einem anderen Linux/Live-USB"
-            err "     kompilieren und mitbringen (siehe README, Abschnitt Unraid)."
             if printf '%s\n' "${MISSING[@]}" | grep -qx "gcc"; then
-                die "gcc fehlt - Abbruch. Siehe Hinweise oben."
+                err "Auf Unraid 7+ gibt es keinen mitgelieferten Compiler, und das fruehere"
+                err "'NerdTools'-Plugin ist nicht mehr kompatibel/verfuegbar."
+                err "Der Auto-Download vorgebauter Binaries ist ebenfalls fehlgeschlagen."
+                err ""
+                err "Manuelle Wege - OHNE Compiler auf dem Server:"
+                err "  1. Auf einem anderen Linux (z.B. Ubuntu Live-USB) die Hilfsprogramme bauen:"
+                err "       sudo bash x710-unlock.sh --build-only"
+                err "     Das legt sie unter ./x710-prebuilt/ ab."
+                err "  2. Den Ordner x710-prebuilt/ auf den Unraid-Server kopieren (z.B. nach"
+                err "     /boot/x710-prebuilt) und dort starten mit:"
+                err "       bash x710-unlock.sh --prebuilt /boot/x710-prebuilt"
+                err ""
+                err "Alternativ (fortgeschritten): gcc als Slackware-Paket nach /boot/extra"
+                err "legen, oder in einem Linux-Docker-Container mit gemountetem --privileged"
+                err "Zugriff arbeiten."
+                die "gcc fehlt auf Unraid und Auto-Download scheiterte - Abbruch. Siehe Hinweise oben."
             fi
-            # ethtool/ip/lspci fehlen seltener; falls doch:
-            die "Benoetigte Tools fehlen (${MISSING[*]}). Bitte via NerdTools bereitstellen."
+            die "Benoetigte Runtime-Tools fehlen (${MISSING[*]}). Diese sollten auf Unraid vorhanden sein - bitte pruefen."
             ;;
         *)
             die "Unbekannte Distribution und fehlende Tools (${MISSING[*]}). Bitte manuell installieren: gcc, ethtool, pciutils, iproute2"
             ;;
     esac
 fi
-ok "Alle Tools vorhanden (gcc, ethtool, lspci, ip)"
+ok "Benoetigte Tools vorhanden"
 
-# ---------- C-Quellen schreiben & kompilieren ----------
+# ---------- C-Quellen schreiben & (kompilieren | prebuilt nutzen) ----------
+if [[ -n "$PREBUILT_DIR" ]]; then
+    step "Vorgebaute Hilfsprogramme verwenden"
+    for b in x710_read x710_write x710_csum; do
+        if [[ ! -x "$PREBUILT_DIR/$b" ]]; then
+            die "Vorgebautes Programm fehlt oder nicht ausfuehrbar: $PREBUILT_DIR/$b"
+        fi
+        cp "$PREBUILT_DIR/$b" "$WORKDIR/$b"
+        chmod +x "$WORKDIR/$b"
+    done
+    ok "Vorgebaute Hilfsprogramme aus $PREBUILT_DIR uebernommen"
+else
 step "Tools kompilieren"
 
 cat > "$WORKDIR/syscalls.h" <<'EOF'
@@ -244,6 +322,19 @@ gcc -O2 -o "$WORKDIR/x710_read"  "$WORKDIR/x710_read.c"  || die "Kompilation x71
 gcc -O2 -o "$WORKDIR/x710_write" "$WORKDIR/x710_write.c" || die "Kompilation x710_write fehlgeschlagen"
 gcc -O2 -o "$WORKDIR/x710_csum"  "$WORKDIR/x710_csum.c"  || die "Kompilation x710_csum fehlgeschlagen"
 ok "Tools kompiliert"
+fi   # Ende: prebuilt vs. selbst kompilieren
+
+# ---------- build-only: Binaries exportieren und beenden ----------
+if [[ $BUILD_ONLY -eq 1 ]]; then
+    OUT="./x710-prebuilt"
+    mkdir -p "$OUT"
+    cp "$WORKDIR/x710_read" "$WORKDIR/x710_write" "$WORKDIR/x710_csum" "$OUT/"
+    chmod +x "$OUT/"x710_*
+    ok "Hilfsprogramme gebaut und abgelegt unter: $OUT/"
+    info "Diesen Ordner auf das Zielsystem (z.B. Unraid) kopieren und dort starten mit:"
+    info "    bash x710-unlock.sh --prebuilt <pfad-zu>/x710-prebuilt"
+    exit 0
+fi
 
 # ---------- Treiber-Reload ----------
 reload_driver() {

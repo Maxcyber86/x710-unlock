@@ -73,6 +73,8 @@ sudo bash x710-unlock.sh [OPTIONS]
   -y, --yes            No prompts (fully automatic — use with caution!)
       --dry-run        Analyze only, write nothing
       --restore        Revert the patch (set bit 11 again)
+      --build-only     Only build the helper binaries (-> ./x710-prebuilt), then exit
+      --prebuilt DIR   Use prebuilt helper binaries from DIR (no gcc needed on target)
   -h, --help           Show help
 ```
 
@@ -140,22 +142,64 @@ are untested — the DeviceID can be adjusted at the top of the script.
 
 ## Unraid (7.3+)
 
-The script detects Unraid automatically (`/etc/unraid-version`) and adapts:
+The script detects Unraid automatically (`/etc/unraid-version`) and adapts.
 
-- **No compiler by default.** Unraid ships without `gcc`. Install the **NerdTools**
-  plugin (via Community Applications) and enable `gcc`, `make`, `binutils`. Alternatively,
-  compile the three helper programs on another Linux / live USB and bring the binaries.
+**One-click on Unraid too** — if no compiler is present (the norm on Unraid 7, where the
+former *NerdTools* plugin no longer works), the script **automatically downloads the
+prebuilt helper binaries** from this repo's `x710-prebuilt/` folder and validates them
+(ELF magic check). So the same single command works:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Maxcyber86/x710-unlock/main/x710-unlock.sh -o x710-unlock.sh
+sudo bash x710-unlock.sh --dry-run
+sudo bash x710-unlock.sh
+```
+
+> Requires that `x710-prebuilt/x710_read`, `x710_write`, `x710_csum` (x86_64 ELF) are
+> present in the repo. Maintainers: build them once with `--build-only` on any Linux and
+> commit them (see "Maintainer" below).
+
+**Manual / offline fallback** (no internet on the server, or you don't trust the repo
+binaries — compile yourself):
+
+```bash
+# On any other Linux (e.g. an Ubuntu live USB):
+sudo bash x710-unlock.sh --build-only      # -> creates ./x710-prebuilt/
+
+# Copy that folder to the server (e.g. /boot/x710-prebuilt), then on Unraid:
+bash x710-unlock.sh --prebuilt /boot/x710-prebuilt
+```
+
+Other Unraid notes:
+
 - **Driver in use.** The `i40e` driver often has Docker bridges, VLANs or VM/vhost
   attached, which prevents `modprobe -r i40e`. Before the real run, stop the Docker
-  service and any VMs that bind the card. The script checks the module refcount and
-  warns accordingly.
+  service and any VMs that bind the card. The script checks the module refcount and warns.
 - **Self-cut protection.** If the X710 carries your management connection (SSH or the
   default route), reloading the driver would cut you off mid-patch. The script detects
-  this and refuses to run (even with `--yes`) unless you confirm you are physically at
-  the console. **Best practice: do the patch from a separate NIC** (e.g. the onboard
-  interface) so the X710 is free, or work locally at the console.
+  this and refuses to run (even with `--yes`) unless you confirm you are at the console.
+  **Best practice: patch from a separate NIC** so the X710 is free, or work locally.
 
 **Secure Boot** must be off (see Requirements) — relevant on bare-metal Unraid too.
+
+### Maintainer: providing the prebuilt binaries
+
+The auto-download expects three x86_64 ELF files in `x710-prebuilt/`. To (re)generate them:
+
+```bash
+# On any x86_64 Linux with gcc:
+sudo bash x710-unlock.sh --build-only      # creates ./x710-prebuilt/
+git add x710-prebuilt/x710_read x710-prebuilt/x710_write x710-prebuilt/x710_csum
+git commit -m "Add prebuilt helper binaries for Unraid auto-download"
+git push
+```
+
+Note: `.gitignore` ignores loose `x710_read`/`x710_write`/`x710_csum` elsewhere, but the
+copies inside `x710-prebuilt/` are force-added by the path above and tracked normally.
+
+
+
+
 
 ## License
 
@@ -231,6 +275,8 @@ sudo bash x710-unlock.sh [OPTIONEN]
   -y, --yes            Keine Rückfragen (vollautomatisch — mit Vorsicht!)
       --dry-run        Nur analysieren, nichts schreiben
       --restore        Patch rückgängig machen (Bit 11 wieder setzen)
+      --build-only     Nur die Hilfsprogramme bauen (-> ./x710-prebuilt), dann beenden
+      --prebuilt DIR   Vorgebaute Hilfsprogramme aus DIR nutzen (kein gcc noetig)
   -h, --help           Hilfe anzeigen
 ```
 
@@ -298,25 +344,63 @@ Sollte auf allen X710/XL710 (DeviceID `8086:1572`) funktionieren. Andere DeviceI
 
 ## Unraid (7.3+)
 
-Das Script erkennt Unraid automatisch (`/etc/unraid-version`) und passt sich an:
+Das Script erkennt Unraid automatisch (`/etc/unraid-version`) und passt sich an.
 
-- **Kein Compiler standardmaessig.** Unraid bringt kein `gcc` mit. Installiere das
-  Plugin **NerdTools** (via Community Applications) und aktiviere `gcc`, `make`,
-  `binutils`. Alternativ die drei Hilfsprogramme auf einem anderen Linux / Live-USB
-  kompilieren und die Binaries mitbringen.
+**One-Click auch auf Unraid** — ist kein Compiler vorhanden (Normalfall auf Unraid 7, wo
+das fruehere *NerdTools*-Plugin nicht mehr funktioniert), **laedt das Script die
+vorgebauten Hilfsprogramme automatisch** aus dem `x710-prebuilt/`-Ordner dieses Repos und
+validiert sie (ELF-Magic-Pruefung). Damit funktioniert derselbe Einzelbefehl:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Maxcyber86/x710-unlock/main/x710-unlock.sh -o x710-unlock.sh
+sudo bash x710-unlock.sh --dry-run
+sudo bash x710-unlock.sh
+```
+
+> Setzt voraus, dass `x710-prebuilt/x710_read`, `x710_write`, `x710_csum` (x86_64 ELF) im
+> Repo liegen. Maintainer: einmalig mit `--build-only` auf einem beliebigen Linux bauen
+> und committen (siehe "Maintainer" unten).
+
+**Manueller / Offline-Fallback** (kein Internet am Server, oder du willst den Repo-Binaries
+nicht vertrauen — selbst kompilieren):
+
+```bash
+# Auf einem beliebigen anderen Linux (z. B. Ubuntu Live-USB):
+sudo bash x710-unlock.sh --build-only      # -> erzeugt ./x710-prebuilt/
+
+# Diesen Ordner auf den Server kopieren (z. B. /boot/x710-prebuilt), dann auf Unraid:
+bash x710-unlock.sh --prebuilt /boot/x710-prebuilt
+```
+
+Weitere Unraid-Hinweise:
+
 - **Treiber in Benutzung.** Am `i40e`-Treiber haengen oft Docker-Bridges, VLANs oder
-  VM/vhost, was `modprobe -r i40e` verhindert. Vor dem echten Lauf den Docker-Dienst
-  und VMs stoppen, die die Karte binden. Das Script prueft den Modul-Refcount und warnt
-  entsprechend.
+  VM/vhost, was `modprobe -r i40e` verhindert. Vor dem echten Lauf den Docker-Dienst und
+  VMs stoppen, die die Karte binden. Das Script prueft den Modul-Refcount und warnt.
 - **Self-Cut-Schutz.** Traegt die X710 deine Management-Verbindung (SSH oder die
   Default-Route), wuerde der Treiber-Reload dich mitten im Patch abschneiden. Das Script
   erkennt das und verweigert die Ausfuehrung (auch mit `--yes`), ausser du bestaetigst,
-  dass du physisch an der Konsole sitzt. **Empfehlung: den Patch ueber eine separate NIC**
-  (z. B. das Onboard-Interface) ausfuehren, sodass die X710 frei ist, oder lokal an der
-  Konsole arbeiten.
+  dass du an der Konsole sitzt. **Empfehlung: ueber eine separate NIC patchen**, sodass
+  die X710 frei ist, oder lokal arbeiten.
 
 **Sicherer Start (Secure Boot)** muss aus sein (siehe Voraussetzungen) — auch auf
 Bare-Metal-Unraid relevant.
+
+### Maintainer: vorgebaute Binaries bereitstellen
+
+Der Auto-Download erwartet drei x86_64-ELF-Dateien in `x710-prebuilt/`. Zum (Neu-)Erzeugen:
+
+```bash
+# Auf einem beliebigen x86_64-Linux mit gcc:
+sudo bash x710-unlock.sh --build-only      # erzeugt ./x710-prebuilt/
+git add x710-prebuilt/x710_read x710-prebuilt/x710_write x710-prebuilt/x710_csum
+git commit -m "Add prebuilt helper binaries for Unraid auto-download"
+git push
+```
+
+Hinweis: Die `.gitignore` ignoriert lose `x710_read`/`x710_write`/`x710_csum` an anderen
+Orten, aber die Kopien in `x710-prebuilt/` werden ueber den obigen Pfad explizit
+hinzugefuegt und normal versioniert.
 
 ## Lizenz
 

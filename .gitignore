@@ -6,17 +6,23 @@ nvm_backup*.txt
 dump.txt
 phy_records.txt
 
-# Kompilate (werden vom Script zur Laufzeit in /tmp gebaut, aber falls lokal getestet)
-mytool
-mypoke
-mypoke_single
-mypoke_csum
-mypoke_csum_v2
-x710_read
-x710_write
-x710_csum
+# Lose Kompilate (zur Laufzeit in /tmp gebaut, oder lokale Testbuilds)
+/mytool
+/mypoke
+/mypoke_single
+/mypoke_csum
+/mypoke_csum_v2
+/x710_read
+/x710_write
+/x710_csum
 *.o
 *.out
+
+# ABER: die vorgebauten Binaries fuer den Unraid-Auto-Download sollen versioniert werden
+!x710-prebuilt/
+!x710-prebuilt/x710_read
+!x710-prebuilt/x710_write
+!x710-prebuilt/x710_csum
 
 # Editor / OS
 *.swp
