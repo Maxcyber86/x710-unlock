@@ -397,6 +397,8 @@ do_csum() {    # do_csum
 
 # ---------- Interface-Detection ----------
 step "X710-Interface ermitteln"
+
+# Alle i40e-Interfaces sammeln
 mapfile -t I40E_IFACES < <(
     for n in /sys/class/net/*; do
         [[ -e "$n/device/driver" ]] || continue
@@ -405,27 +407,71 @@ mapfile -t I40E_IFACES < <(
     done
 )
 
+# Hilfsfunktion: PCI-Adresse eines Interfaces (z.B. 0000:01:00.0)
+_pci_of_if() {
+    local dl; dl="$(readlink -f "/sys/class/net/$1/device" 2>/dev/null)" || return 1
+    basename "$dl"
+}
+
 if [[ -n "$IFACE" ]]; then
-    ok "Interface manuell gesetzt: $IFACE"
+    # Manuell gesetztes Interface: auf ersten Port der Karte normalisieren
+    man_pci="$(_pci_of_if "$IFACE" || true)"
+    if [[ -n "$man_pci" ]]; then
+        man_slot="${man_pci%.*}"
+        # gibt es ein Geschwister mit Funktion .0 auf derselben Karte?
+        for cand in "${I40E_IFACES[@]}"; do
+            cp="$(_pci_of_if "$cand" || true)"
+            if [[ "$cp" == "${man_slot}.0" && "$cand" != "$IFACE" ]]; then
+                warn "Hinweis: $IFACE ist nicht der erste Port dieser Karte."
+                warn "Beide Ports teilen sich dasselbe EEPROM - es wird der erste Port"
+                warn "($cand, PCI ${man_slot}.0) verwendet (Konvention, gleiches Ergebnis)."
+                IFACE="$cand"
+                break
+            fi
+        done
+    fi
+    ok "Interface gesetzt: $IFACE"
 elif [[ ${#I40E_IFACES[@]} -eq 0 ]]; then
     die "Kein i40e-Interface gefunden. Ist die X710 verbaut und der Treiber geladen?"
-elif [[ ${#I40E_IFACES[@]} -eq 1 ]]; then
-    IFACE="${I40E_IFACES[0]}"
-    ok "i40e-Interface gefunden: $IFACE"
 else
-    warn "Mehrere i40e-Interfaces gefunden:"
-    for i in "${!I40E_IFACES[@]}"; do
-        mac="$(cat /sys/class/net/${I40E_IFACES[$i]}/address 2>/dev/null)"
-        echo "    [$i] ${I40E_IFACES[$i]}  (MAC $mac)"
+    # Nach KARTE (PCI-Slot ohne Funktion) gruppieren, je Karte den .0-Port nehmen.
+    declare -A CARD_FIRSTPORT=()   # slot -> iface (.0)
+    declare -A CARD_ANYPORT=()     # slot -> irgendein iface (Fallback)
+    CARD_ORDER=()
+    for ifc in "${I40E_IFACES[@]}"; do
+        p="$(_pci_of_if "$ifc" || true)"; [[ -z "$p" ]] && continue
+        slot="${p%.*}"; func="${p##*.}"
+        [[ -z "${CARD_ANYPORT[$slot]:-}" ]] && { CARD_ANYPORT[$slot]="$ifc"; CARD_ORDER+=("$slot"); }
+        [[ "$func" == "0" ]] && CARD_FIRSTPORT[$slot]="$ifc"
     done
-    if [[ $ASSUME_YES -eq 1 ]]; then
-        IFACE="${I40E_IFACES[0]}"
-        warn "--yes aktiv: nehme erstes Interface $IFACE"
+
+    # Kandidatenliste: ein Eintrag pro Karte (bevorzugt .0)
+    CARD_IFACES=()
+    for slot in "${CARD_ORDER[@]}"; do
+        CARD_IFACES+=("${CARD_FIRSTPORT[$slot]:-${CARD_ANYPORT[$slot]}}")
+    done
+
+    if [[ ${#CARD_IFACES[@]} -eq 1 ]]; then
+        IFACE="${CARD_IFACES[0]}"
+        ok "Eine X710-Karte gefunden, erster Port: $IFACE"
     else
-        read -rp "Welches Interface (Index)? " idx
-        IFACE="${I40E_IFACES[$idx]}" || die "Ungueltiger Index"
+        warn "Mehrere X710-Karten gefunden (je Karte wird der erste Port verwendet):"
+        for i in "${!CARD_IFACES[@]}"; do
+            ifc="${CARD_IFACES[$i]}"
+            mac="$(cat "/sys/class/net/$ifc/address" 2>/dev/null)"
+            pci="$(_pci_of_if "$ifc")"
+            echo "    [$i] Karte @ ${pci%.*}  ->  erster Port $ifc  (MAC $mac)"
+        done
+        if [[ $ASSUME_YES -eq 1 ]]; then
+            IFACE="${CARD_IFACES[0]}"
+            warn "--yes aktiv: nehme erste Karte (erster Port $IFACE)"
+        else
+            read -rp "Welche Karte (Index)? " idx
+            [[ "$idx" =~ ^[0-9]+$ && -n "${CARD_IFACES[$idx]:-}" ]] || die "Ungueltiger Index"
+            IFACE="${CARD_IFACES[$idx]}"
+        fi
+        ok "Gewaehlt: $IFACE (erster Port der Karte)"
     fi
-    ok "Gewaehlt: $IFACE"
 fi
 
 # Verifizieren dass es wirklich eine 1572 ist
@@ -438,56 +484,140 @@ fi
 
 # ---------- Self-Cut-Schutz ----------
 # Das Script laedt den i40e-Treiber wiederholt neu. Wenn die aktuelle
-# SSH-Verbindung oder die Default-Route ueber GENAU DIESES Interface laeuft,
-# kappt der erste Reload die eigene Verbindung -> Abbruch mitten im Patch.
+# SSH-Verbindung oder die Default-Route ueber GENAU DIESE KARTE laeuft -
+# auch indirekt ueber eine Bridge (br0), ein vhost/macvtap (vhost2), ein
+# VLAN oder ein Bond - kappt der Reload die eigene Verbindung.
+# Auf Unraid ist das der Normalfall: vhost2/br0 sitzt auf eth2 auf.
 step "Verbindungsweg pruefen (Self-Cut-Schutz)"
 
-# Liste der Sub-Interfaces / IFs, die zur selben Karte gehoeren (gleiche PCI bus-info)
+# Loest ein (ggf. virtuelles) Interface rekursiv auf seine zugrunde-
+# liegenden PHYSISCHEN Interfaces auf (Bridge-Member, lower_* Links).
+resolve_underlying() {
+    local seen=" " queue="$1" result=""
+    while [[ -n "$queue" ]]; do
+        local cur="${queue%% *}"
+        queue="${queue#"$cur"}"; queue="${queue# }"
+        [[ "$seen" == *" $cur "* ]] && continue
+        seen="$seen$cur "
+        local has_lower=0
+        if [[ -d "/sys/class/net/$cur/brif" ]]; then
+            for m in /sys/class/net/$cur/brif/*; do
+                [[ -e "$m" ]] || continue
+                queue="$queue $(basename "$m")"; has_lower=1
+            done
+        fi
+        for l in /sys/class/net/"$cur"/lower_*; do
+            [[ -e "$l" ]] || continue
+            local ln; ln="$(basename "$l")"; ln="${ln#lower_}"
+            queue="$queue $ln"; has_lower=1
+        done
+        if [[ $has_lower -eq 0 && -e "/sys/class/net/$cur/device" ]]; then
+            result="$result $cur"
+        fi
+    done
+    echo "$result" | tr ' ' '\n' | grep -v '^$' | sort -u
+}
+
+# PCI-Bus-Adresse eines Interfaces (z.B. 0000:01:00.0)
+pci_of() {
+    local dl; dl="$(readlink -f "/sys/class/net/$1/device" 2>/dev/null)" || return 1
+    basename "$dl"
+}
+
+# Alle physischen Interfaces, die zur SELBEN Karte gehoeren wie $IFACE
+# (gleiche PCI-Funktion oder gleiches PCI-"slot", da DA2 = 2 Funktionen).
+target_pci="$(pci_of "$IFACE" || true)"
+target_slot="${target_pci%.*}"   # ohne Funktion (.0/.1)
+info "Ziel $IFACE -> PCI ${target_pci:-unbekannt} (Slot ${target_slot:-?})"
+
+is_same_card() {  # arg: physisches iface -> 0 wenn selbe Karte wie IFACE
+    local p; p="$(pci_of "$1" || true)"
+    [[ -z "$p" ]] && return 1
+    [[ "$p" == "$target_pci" ]] && return 0
+    [[ -n "$target_slot" && "${p%.*}" == "$target_slot" ]] && return 0
+    return 1
+}
+
+# Prueft, ob ein Routing-Interface (auch virtuell) auf unsere Karte fuehrt
+route_hits_card() {  # arg: routing-iface -> 0 = trifft unsere Karte
+    local rif="$1" phys
+    [[ -z "$rif" ]] && return 1
+    # direkt das Ziel-IF?
+    [[ "$rif" == "$IFACE" ]] && return 0
+    for phys in $(resolve_underlying "$rif"); do
+        if is_same_card "$phys"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 danger=0
 reason=""
 
-# 1) SSH-Verbindung: ueber welches IF kommt der SSH-Client rein?
+# 1) SSH-Verbindung
 if [[ -n "${SSH_CONNECTION:-}" ]]; then
     client_ip="$(awk '{print $1}' <<<"$SSH_CONNECTION")"
     ssh_if="$(ip route get "$client_ip" 2>/dev/null | grep -oP 'dev \K\S+' | head -1)"
-    info "SSH-Client: $client_ip  ->  Route ueber Interface: ${ssh_if:-unbekannt}"
-    if [[ -n "$ssh_if" && "$ssh_if" == "$IFACE" ]]; then
+    ssh_phys="$(resolve_underlying "${ssh_if:-}" | tr '\n' ' ')"
+    info "SSH-Client $client_ip -> Route via '${ssh_if:-?}' (physisch: ${ssh_phys:-keine})"
+    if route_hits_card "${ssh_if:-}"; then
         danger=1
-        reason="Deine SSH-Verbindung laeuft ueber $IFACE."
+        reason="Deine SSH-Verbindung laeuft (ueber ${ssh_if}) auf die Karte von $IFACE."
     fi
 fi
 
-# 2) Default-Route ueber das Ziel-Interface?
+# 2) Default-Route
 def_if="$(ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1)"
-info "Default-Route ueber Interface: ${def_if:-keine}"
-if [[ -n "$def_if" && "$def_if" == "$IFACE" ]]; then
+def_phys="$(resolve_underlying "${def_if:-}" | tr '\n' ' ')"
+info "Default-Route via '${def_if:-keine}' (physisch: ${def_phys:-keine})"
+if route_hits_card "${def_if:-}"; then
     danger=1
-    reason="${reason:+$reason }Die Default-Route laeuft ueber $IFACE."
+    reason="${reason:+$reason }Die Default-Route laeuft (ueber ${def_if}) auf die Karte von $IFACE."
+fi
+
+# 3) Generell: ist IRGENDEINE aktive Route ueber unsere Karte? (Info/Warnung)
+if [[ $danger -eq 0 ]]; then
+    # Pruefe alle Interfaces mit IPs, ob sie auf die Karte fuehren
+    while read -r anyif; do
+        [[ -z "$anyif" ]] && continue
+        if route_hits_card "$anyif"; then
+            warn "Hinweis: Interface '$anyif' fuehrt ebenfalls auf diese Karte und wird beim Reload kurz wegfallen."
+        fi
+    done < <(ip -o addr show 2>/dev/null | awk '$3=="inet"{print $2}' | sort -u)
 fi
 
 if [[ $danger -eq 1 ]]; then
     echo
     err "WARNUNG: $reason"
     err "Der Treiber-Reload (modprobe -r i40e) wuerde diese Verbindung KAPPEN -"
-    err "das Script wuerde mittendrin abbrechen, im schlimmsten Fall mit halb"
-    err "geschriebenem EEPROM."
+    err "auch wenn sie ueber eine Bridge (br0) oder vhost/macvtap (vhost2) laeuft,"
+    err "die auf der Karte aufsitzt. Das Script wuerde mittendrin abbrechen, im"
+    err "schlimmsten Fall mit halb geschriebenem EEPROM - und der Server haengt"
+    err "bis zum Hard-Reset."
     echo
     err "Sichere Wege:"
-    err "  - Lokal an der Konsole arbeiten (Monitor + Tastatur), nicht per SSH ueber $IFACE"
-    err "  - Oder ueber ein ANDERES Netzwerk-Interface verbinden (z.B. Onboard-NIC),"
-    err "    sodass $IFACE frei ist"
+    err "  - Lokal an der physischen Konsole arbeiten (Monitor + Tastatur)"
+    err "  - Oder ueber einen Pfad verbinden, der NICHT auf dieser Karte liegt"
+    err "    (z.B. Onboard-NIC / IPMI / Intel AMT)"
     if [[ "$OS" == "unraid" ]]; then
-        err "  - Auf Unraid: stelle sicher, dass $IFACE NICHT dein Management-Interface (br0/eth0) ist"
+        err "  - Auf Unraid: Management (br0) haengt typ. an eth0/Onboard - stelle sicher,"
+        err "    dass dein Zugriff NICHT ueber die zu patchende Karte ($IFACE) laeuft."
+        err "    Tipp: Intel AMT / IPMI ist OS-unabhaengig und ueberlebt den Reload."
     fi
     echo
-    if [[ $ASSUME_YES -eq 1 ]]; then
-        die "Abbruch wegen Self-Cut-Risiko (auch mit --yes wird hier abgebrochen, das ist Absicht)."
+    # Hier IMMER hart abbrechen - auch interaktiv, weil remote zu gefaehrlich.
+    # Nur wer wirklich lokal sitzt, soll mit --i-am-at-console fortfahren.
+    if [[ "${CONSOLE_OVERRIDE:-0}" == "1" ]]; then
+        warn "CONSOLE_OVERRIDE=1 gesetzt - du faehrst auf eigenes Risiko fort."
+    else
+        err "Abbruch. Wenn du WIRKLICH an der lokalen Konsole sitzt (nicht remote!),"
+        err "starte erneut mit vorangestelltem  CONSOLE_OVERRIDE=1 :"
+        err "    CONSOLE_OVERRIDE=1 bash $0 ${*:-}"
+        die "Self-Cut-Risiko erkannt - sicherheitshalber gestoppt."
     fi
-    read -rp "Trotzdem fortfahren? Nur sinnvoll wenn du WIRKLICH lokal an der Konsole sitzt [tippe ' trotzdem ']: " sc
-    [[ "$sc" == "trotzdem" ]] || die "Abgebrochen (empfohlen)."
-    warn "Du faehrst auf eigenes Risiko fort."
 else
-    ok "Kein Self-Cut-Risiko erkannt - $IFACE traegt weder SSH noch Default-Route."
+    ok "Kein Self-Cut-Risiko erkannt - weder SSH noch Default-Route fuehren auf die Karte von $IFACE."
 fi
 
 # ---------- Unraid: i40e in-use Pruefung ----------

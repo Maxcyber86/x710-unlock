@@ -118,6 +118,17 @@ recomputing the NVM checksum disables the check.
 The script auto-detects the offset and stride of the records (these vary by NVM
 version), so no hard-coded addresses are needed.
 
+### Which port on a dual/quad-port card?
+
+Both ports of a multi-port X710 (e.g. a DA2's two ports, PCI functions `.0` and `.1`)
+**share the same physical EEPROM**. The patch therefore has the same effect regardless of
+which port you go through, and there is no benefit to using the second port.
+
+To avoid any ambiguity the script **always uses the first port** (`.0`) of a card
+automatically. If you pass a second port via `-i` (e.g. `-i eth3`), it is normalized back
+to the first port of that same card. When several **different** X710 cards are present, the
+script asks which *card* to use — but never which port.
+
 ### The i40e NVM lock
 
 The `i40e` driver often locks further NVM operations after an EEPROM access
@@ -175,10 +186,16 @@ Other Unraid notes:
 - **Driver in use.** The `i40e` driver often has Docker bridges, VLANs or VM/vhost
   attached, which prevents `modprobe -r i40e`. Before the real run, stop the Docker
   service and any VMs that bind the card. The script checks the module refcount and warns.
-- **Self-cut protection.** If the X710 carries your management connection (SSH or the
-  default route), reloading the driver would cut you off mid-patch. The script detects
-  this and refuses to run (even with `--yes`) unless you confirm you are at the console.
-  **Best practice: patch from a separate NIC** so the X710 is free, or work locally.
+- **Self-cut protection (bridge/vhost aware).** Reloading the driver drops the card and
+  every interface stacked on top of it. The script resolves the full interface hierarchy
+  (bridges like `br0`, `vhost`/macvtap like `vhost2`, VLANs, bonds) down to the physical
+  ports and also matches sibling ports on the same PCI card (e.g. eth2 **and** eth3 of a
+  DA2). If your SSH session or the default route reaches the card **through any of these**,
+  it aborts. On Unraid the default route typically runs over `vhost2`/`br0` which sits on
+  the X710 — exactly this indirect case is now caught. To proceed you must be **physically
+  at the console** and restart with `CONSOLE_OVERRIDE=1` prepended; there is no interactive
+  bypass (too dangerous remotely). **Best practice: patch over a path NOT on this card**
+  (onboard NIC, IPMI, or Intel AMT, which survives the reload).
 
 **Secure Boot** must be off (see Requirements) — relevant on bare-metal Unraid too.
 
@@ -320,6 +337,17 @@ gelöscht und die NVM-Checksumme neu berechnet, ist die Prüfung deaktiviert.
 Das Script erkennt Offset und Schrittweite der Records automatisch (diese variieren je
 nach NVM-Version), sodass keine fest verdrahteten Adressen nötig sind.
 
+### Welcher Port bei Dual-/Quad-Port-Karten?
+
+Beide Ports einer mehrportigen X710 (z. B. die zwei Ports einer DA2, PCI-Funktionen `.0`
+und `.1`) **teilen sich dasselbe physische EEPROM**. Der Patch wirkt daher identisch, egal
+ueber welchen Port man geht - der zweite Port bringt keinen Vorteil.
+
+Um jede Mehrdeutigkeit zu vermeiden, nutzt das Script **automatisch immer den ersten Port**
+(`.0`) einer Karte. Gibt man per `-i` einen zweiten Port an (z. B. `-i eth3`), wird er auf
+den ersten Port derselben Karte zurueckgesetzt. Sind mehrere **verschiedene** X710-Karten
+vorhanden, fragt das Script, welche *Karte* genutzt werden soll - aber nie, welcher Port.
+
 ### Der i40e-NVM-Lock
 
 Der `i40e`-Treiber sperrt nach EEPROM-Zugriffen oft weitere NVM-Operationen
@@ -377,11 +405,18 @@ Weitere Unraid-Hinweise:
 - **Treiber in Benutzung.** Am `i40e`-Treiber haengen oft Docker-Bridges, VLANs oder
   VM/vhost, was `modprobe -r i40e` verhindert. Vor dem echten Lauf den Docker-Dienst und
   VMs stoppen, die die Karte binden. Das Script prueft den Modul-Refcount und warnt.
-- **Self-Cut-Schutz.** Traegt die X710 deine Management-Verbindung (SSH oder die
-  Default-Route), wuerde der Treiber-Reload dich mitten im Patch abschneiden. Das Script
-  erkennt das und verweigert die Ausfuehrung (auch mit `--yes`), ausser du bestaetigst,
-  dass du an der Konsole sitzt. **Empfehlung: ueber eine separate NIC patchen**, sodass
-  die X710 frei ist, oder lokal arbeiten.
+- **Self-Cut-Schutz (Bridge/vhost-bewusst).** Der Treiber-Reload wirft die Karte ab -
+  samt aller darauf aufsitzenden Interfaces. Das Script loest die komplette Hierarchie
+  auf (Bridges wie `br0`, `vhost`/macvtap wie `vhost2`, VLANs, Bonds) bis zu den
+  physischen Ports und erkennt auch Geschwister-Ports derselben PCI-Karte (z.B. eth2
+  **und** eth3 einer DA2). Fuehrt deine SSH-Sitzung oder die Default-Route **ueber
+  irgendeinen dieser Wege** auf die Karte, bricht es ab. Auf Unraid laeuft die
+  Default-Route typischerweise ueber `vhost2`/`br0`, das auf der X710 sitzt - genau dieser
+  indirekte Fall wird jetzt erkannt. Zum Fortfahren musst du **physisch an der Konsole**
+  sitzen und mit vorangestelltem `CONSOLE_OVERRIDE=1` neu starten; es gibt keinen
+  interaktiven Bypass (remote zu gefaehrlich). **Empfehlung: ueber einen Pfad patchen, der
+  NICHT auf dieser Karte liegt** (Onboard-NIC, IPMI oder Intel AMT, das den Reload
+  ueberlebt).
 
 **Sicherer Start (Secure Boot)** muss aus sein (siehe Voraussetzungen) — auch auf
 Bare-Metal-Unraid relevant.
