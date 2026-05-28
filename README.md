@@ -138,6 +138,25 @@ The NVM checksum recalc operation needs the ethtool magic
 Should work on all X710/XL710 (DeviceID `8086:1572`). Other DeviceIDs (X722 etc.)
 are untested — the DeviceID can be adjusted at the top of the script.
 
+## Unraid (7.3+)
+
+The script detects Unraid automatically (`/etc/unraid-version`) and adapts:
+
+- **No compiler by default.** Unraid ships without `gcc`. Install the **NerdTools**
+  plugin (via Community Applications) and enable `gcc`, `make`, `binutils`. Alternatively,
+  compile the three helper programs on another Linux / live USB and bring the binaries.
+- **Driver in use.** The `i40e` driver often has Docker bridges, VLANs or VM/vhost
+  attached, which prevents `modprobe -r i40e`. Before the real run, stop the Docker
+  service and any VMs that bind the card. The script checks the module refcount and
+  warns accordingly.
+- **Self-cut protection.** If the X710 carries your management connection (SSH or the
+  default route), reloading the driver would cut you off mid-patch. The script detects
+  this and refuses to run (even with `--yes`) unless you confirm you are physically at
+  the console. **Best practice: do the patch from a separate NIC** (e.g. the onboard
+  interface) so the X710 is free, or work locally at the console.
+
+**Secure Boot** must be off (see Requirements) — relevant on bare-metal Unraid too.
+
 ## License
 
 MIT. See `LICENSE`. Without any warranty.
@@ -276,6 +295,28 @@ bei Bedarf auf `CSUM` allein zurück.
 
 Sollte auf allen X710/XL710 (DeviceID `8086:1572`) funktionieren. Andere DeviceIDs
 (X722 etc.) sind nicht getestet — die DeviceID lässt sich oben im Script anpassen.
+
+## Unraid (7.3+)
+
+Das Script erkennt Unraid automatisch (`/etc/unraid-version`) und passt sich an:
+
+- **Kein Compiler standardmaessig.** Unraid bringt kein `gcc` mit. Installiere das
+  Plugin **NerdTools** (via Community Applications) und aktiviere `gcc`, `make`,
+  `binutils`. Alternativ die drei Hilfsprogramme auf einem anderen Linux / Live-USB
+  kompilieren und die Binaries mitbringen.
+- **Treiber in Benutzung.** Am `i40e`-Treiber haengen oft Docker-Bridges, VLANs oder
+  VM/vhost, was `modprobe -r i40e` verhindert. Vor dem echten Lauf den Docker-Dienst
+  und VMs stoppen, die die Karte binden. Das Script prueft den Modul-Refcount und warnt
+  entsprechend.
+- **Self-Cut-Schutz.** Traegt die X710 deine Management-Verbindung (SSH oder die
+  Default-Route), wuerde der Treiber-Reload dich mitten im Patch abschneiden. Das Script
+  erkennt das und verweigert die Ausfuehrung (auch mit `--yes`), ausser du bestaetigst,
+  dass du physisch an der Konsole sitzt. **Empfehlung: den Patch ueber eine separate NIC**
+  (z. B. das Onboard-Interface) ausfuehren, sodass die X710 frei ist, oder lokal an der
+  Konsole arbeiten.
+
+**Sicherer Start (Secure Boot)** muss aus sein (siehe Voraussetzungen) — auch auf
+Bare-Metal-Unraid relevant.
 
 ## Lizenz
 

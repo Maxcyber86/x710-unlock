@@ -75,15 +75,57 @@ done
 # ---------- Vorbedingungen ----------
 [[ $EUID -eq 0 ]] || die "Bitte mit sudo/root ausfuehren."
 
-step "Vorbedingungen pruefen"
-for tool in gcc ethtool lspci ip; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        warn "$tool fehlt - versuche zu installieren..."
-        apt-get update -qq && apt-get install -y -qq build-essential ethtool pciutils || \
-            die "Konnte Abhaengigkeiten nicht installieren. Bitte manuell: apt install build-essential ethtool pciutils"
-        break
+# OS erkennen: unraid / debian / other
+detect_os() {
+    if [[ -f /etc/unraid-version ]]; then
+        echo "unraid"
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "debian"
+    else
+        echo "other"
     fi
+}
+OS="$(detect_os)"
+
+step "Vorbedingungen pruefen"
+info "Erkanntes System: $OS"
+if [[ "$OS" == "unraid" ]]; then
+    UNRAID_VER="$(cat /etc/unraid-version 2>/dev/null | tr -d '"' | cut -d= -f2)"
+    info "Unraid-Version: ${UNRAID_VER:-unbekannt}"
+fi
+
+# Tool-Verfuegbarkeit pruefen
+MISSING=()
+for tool in gcc ethtool lspci ip; do
+    command -v "$tool" >/dev/null 2>&1 || MISSING+=("$tool")
 done
+
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+    warn "Fehlende Tools: ${MISSING[*]}"
+    case "$OS" in
+        debian)
+            warn "Versuche per apt zu installieren..."
+            apt-get update -qq && apt-get install -y -qq build-essential ethtool pciutils iproute2 || \
+                die "Installation fehlgeschlagen. Bitte manuell: apt install build-essential ethtool pciutils iproute2"
+            ;;
+        unraid)
+            err "Auf Unraid werden Pakete nicht automatisch installiert."
+            err "Unraid bringt standardmaessig keinen Compiler mit. Loesungen:"
+            err "  1. Plugin 'NerdTools' (via Community Applications) installieren und dort"
+            err "     gcc, make, binutils aktivieren. Danach dieses Script erneut starten."
+            err "  2. Alternativ die drei Hilfsprogramme auf einem anderen Linux/Live-USB"
+            err "     kompilieren und mitbringen (siehe README, Abschnitt Unraid)."
+            if printf '%s\n' "${MISSING[@]}" | grep -qx "gcc"; then
+                die "gcc fehlt - Abbruch. Siehe Hinweise oben."
+            fi
+            # ethtool/ip/lspci fehlen seltener; falls doch:
+            die "Benoetigte Tools fehlen (${MISSING[*]}). Bitte via NerdTools bereitstellen."
+            ;;
+        *)
+            die "Unbekannte Distribution und fehlende Tools (${MISSING[*]}). Bitte manuell installieren: gcc, ethtool, pciutils, iproute2"
+            ;;
+    esac
+fi
 ok "Alle Tools vorhanden (gcc, ethtool, lspci, ip)"
 
 # ---------- C-Quellen schreiben & kompilieren ----------
@@ -205,9 +247,28 @@ ok "Tools kompiliert"
 
 # ---------- Treiber-Reload ----------
 reload_driver() {
-    modprobe -r i40e 2>/dev/null || true
+    local rmout
+    # Versuch zu entladen; Fehlermeldung einfangen statt verwerfen
+    if lsmod 2>/dev/null | grep -q '^i40e'; then
+        if ! rmout="$(modprobe -r i40e 2>&1)"; then
+            if echo "$rmout" | grep -qi "in use\|busy"; then
+                err "modprobe -r i40e fehlgeschlagen: Treiber ist in Benutzung."
+                err "  -> $rmout"
+                if [[ "$OS" == "unraid" ]]; then
+                    err "Auf Unraid: Docker-Dienst und/oder VMs stoppen, damit keine"
+                    err "Bridges/vhost mehr am Interface haengen, dann erneut starten."
+                else
+                    err "Stoppe Dienste/Bridges/VMs die an $IFACE haengen, dann erneut starten."
+                fi
+                die "Treiber nicht entladbar - Abbruch (es wurde nichts geschrieben sofern vor dem Patch)."
+            else
+                # anderer Fehler - nochmal mit Ausgabe
+                warn "modprobe -r i40e: $rmout"
+            fi
+        fi
+    fi
     sleep 2
-    modprobe i40e
+    modprobe i40e || die "modprobe i40e (laden) fehlgeschlagen."
     sleep "$RELOAD_SETTLE"
     [[ -n "$IFACE" ]] && ip link set "$IFACE" up 2>/dev/null || true
     sleep 2
@@ -282,6 +343,80 @@ if [[ -n "$businfo" ]]; then
     devline="$(lspci -nn -s "$businfo" 2>/dev/null || true)"
     info "PCI: $devline"
     echo "$devline" | grep -q "8086:1572" || warn "Achtung: Device-ID ist nicht 8086:1572 - bist du sicher dass das eine X710 ist?"
+fi
+
+# ---------- Self-Cut-Schutz ----------
+# Das Script laedt den i40e-Treiber wiederholt neu. Wenn die aktuelle
+# SSH-Verbindung oder die Default-Route ueber GENAU DIESES Interface laeuft,
+# kappt der erste Reload die eigene Verbindung -> Abbruch mitten im Patch.
+step "Verbindungsweg pruefen (Self-Cut-Schutz)"
+
+# Liste der Sub-Interfaces / IFs, die zur selben Karte gehoeren (gleiche PCI bus-info)
+danger=0
+reason=""
+
+# 1) SSH-Verbindung: ueber welches IF kommt der SSH-Client rein?
+if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    client_ip="$(awk '{print $1}' <<<"$SSH_CONNECTION")"
+    ssh_if="$(ip route get "$client_ip" 2>/dev/null | grep -oP 'dev \K\S+' | head -1)"
+    info "SSH-Client: $client_ip  ->  Route ueber Interface: ${ssh_if:-unbekannt}"
+    if [[ -n "$ssh_if" && "$ssh_if" == "$IFACE" ]]; then
+        danger=1
+        reason="Deine SSH-Verbindung laeuft ueber $IFACE."
+    fi
+fi
+
+# 2) Default-Route ueber das Ziel-Interface?
+def_if="$(ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1)"
+info "Default-Route ueber Interface: ${def_if:-keine}"
+if [[ -n "$def_if" && "$def_if" == "$IFACE" ]]; then
+    danger=1
+    reason="${reason:+$reason }Die Default-Route laeuft ueber $IFACE."
+fi
+
+if [[ $danger -eq 1 ]]; then
+    echo
+    err "WARNUNG: $reason"
+    err "Der Treiber-Reload (modprobe -r i40e) wuerde diese Verbindung KAPPEN -"
+    err "das Script wuerde mittendrin abbrechen, im schlimmsten Fall mit halb"
+    err "geschriebenem EEPROM."
+    echo
+    err "Sichere Wege:"
+    err "  - Lokal an der Konsole arbeiten (Monitor + Tastatur), nicht per SSH ueber $IFACE"
+    err "  - Oder ueber ein ANDERES Netzwerk-Interface verbinden (z.B. Onboard-NIC),"
+    err "    sodass $IFACE frei ist"
+    if [[ "$OS" == "unraid" ]]; then
+        err "  - Auf Unraid: stelle sicher, dass $IFACE NICHT dein Management-Interface (br0/eth0) ist"
+    fi
+    echo
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        die "Abbruch wegen Self-Cut-Risiko (auch mit --yes wird hier abgebrochen, das ist Absicht)."
+    fi
+    read -rp "Trotzdem fortfahren? Nur sinnvoll wenn du WIRKLICH lokal an der Konsole sitzt [tippe ' trotzdem ']: " sc
+    [[ "$sc" == "trotzdem" ]] || die "Abgebrochen (empfohlen)."
+    warn "Du faehrst auf eigenes Risiko fort."
+else
+    ok "Kein Self-Cut-Risiko erkannt - $IFACE traegt weder SSH noch Default-Route."
+fi
+
+# ---------- Unraid: i40e in-use Pruefung ----------
+if [[ "$OS" == "unraid" ]]; then
+    step "Unraid: Treiber-Entladbarkeit pruefen"
+    refcnt="$(cat /sys/module/i40e/refcnt 2>/dev/null || echo '?')"
+    info "i40e Modul-Refcount: $refcnt"
+    if [[ "$refcnt" != "0" && "$refcnt" != "?" ]]; then
+        warn "Der i40e-Treiber ist in Benutzung (refcount=$refcnt)."
+        warn "Auf Unraid haengen oft Docker-Bridges, VLANs oder vhost am Interface,"
+        warn "die ein 'modprobe -r i40e' verhindern ('Module i40e is in use')."
+        warn "Empfehlung vor dem echten Lauf:"
+        warn "  - Docker-Dienst stoppen (Settings -> Docker -> Enable: No)"
+        warn "  - VMs stoppen (falls VFIO/vhost an der Karte haengt)"
+        warn "  - ggf. Array stoppen, wenn Netzwerk-Shares an der Karte haengen"
+        warn "Das Script versucht den Reload trotzdem - schlaegt er fehl, brichst du"
+        warn "mit Strg+C ab, entlastest die Karte und startest erneut."
+    else
+        ok "i40e ist entladbar (refcount=$refcnt)."
+    fi
 fi
 
 # ---------- EEPROM scannen, PHY-Records finden ----------
