@@ -1,0 +1,30 @@
+# EEPROM-Backups die das Script anlegt (enthalten geraetespezifische Daten / MACs)
+x710-unlock-backups/
+*.bin
+eeprom_*.txt
+nvm_backup*.txt
+dump.txt
+phy_records.txt
+
+# Kompilate (werden vom Script zur Laufzeit in /tmp gebaut, aber falls lokal getestet)
+mytool
+mypoke
+mypoke_single
+mypoke_csum
+mypoke_csum_v2
+x710_read
+x710_write
+x710_csum
+*.o
+*.out
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+*.xml
